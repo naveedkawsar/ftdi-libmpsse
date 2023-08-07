@@ -1,8 +1,9 @@
 #ifndef BMI270_H_
 #define BMI270_H_
 
-#include <stdbool.h>
-#include <stdint.h>
+//#include <stdbool.h>
+//#include <stdint.h>
+#include "ftdi_libMPSSE.h"
 
 // Per section 5.2.42
 typedef enum {
@@ -64,7 +65,7 @@ typedef struct {
 } ConvertedMotionData;
 
 
-bool bmi270_spi_init(OutputDataRateHz accel_data_rate,
+bool bmi270_spi_init(FT_HANDLE handle, OutputDataRateHz accel_data_rate,
                 AccRangeG accel_range,
                 OutputDataRateHz gyro_data_rate, GyroRangeDps gyro_range);
 void bmi270_spi_read_data(void);

@@ -16,7 +16,7 @@ INCLUDES=-I$(UNITY) \
 UNITY_SRC=$(UNITY)/unity.c
 
 bmi270: clean
-	$(CC) bmi270.c $(CFLAGS) -o bmi270; ./bmi270
+	$(CC) bmi270.c timer.c $(CFLAGS) -o bmi270; ./bmi270
 
 clean:
 	rm -f bmi270.exe
