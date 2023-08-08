@@ -6,6 +6,10 @@
 //#include "ftdi_libMPSSE.h"
 
 #define LOG (printf("%s | func: %s() line: %d\n", __FILE__, __func__, __LINE__))
+#define SPI_WRITE_OPTIONS (SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE| SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE)
+
+#define false (0u)
+#define true (!false)
 
 #define BMI270_SDO_MISO_PIN    (26u) // I2C address LSB
 #define BMI270_SDA_MOSI_PIN    (27u) // I2C data line
@@ -85,7 +89,7 @@ typedef struct {
 
 MotionInfo current;
 
-void spi_shift_bytes_with_cs(FT_HANDLE handle, const uint8_t *tx, uint32_t tx_len, uint8_t *rx, uint32_t rx_len)
+void spi_shift_bytes_with_cs(const uint8_t *tx, uint32_t tx_len, uint8_t *rx, uint32_t rx_len)
 {
     // For some reason, SPI_ReadWrite() does not shift any data out, might be
     // an issue with the mingw version of the libmpsse.a file packaged with v0.6
@@ -93,19 +97,31 @@ void spi_shift_bytes_with_cs(FT_HANDLE handle, const uint8_t *tx, uint32_t tx_le
     uint32_t bytes_transferred;
     FT_STATUS status;
     options = SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE;
-    status = SPI_Write(handle, (uint8_t *)tx, tx_len, &bytes_transferred, options);
+    status = SPI_Write(current.handle, (uint8_t *)tx, tx_len, &bytes_transferred, options);
     if (status != FT_OK)
         LOG;
     if (bytes_transferred != tx_len)
         LOG;
     options |= SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE;
-    status = SPI_Read(handle, rx, rx_len, &bytes_transferred, options);
+    status = SPI_Read(current.handle, rx, rx_len, &bytes_transferred, options);
     if (status != FT_OK)
         LOG;
     if (bytes_transferred != rx_len)
         LOG;
 }
 
+void spi_write_with_cs(const uint8_t *tx, uint32_t tx_len)
+{
+    uint32_t options;
+    uint32_t bytes_transferred;
+    FT_STATUS status;
+    options = SPI_WRITE_OPTIONS;
+    status = SPI_Write(current.handle, (uint8_t *)tx, tx_len, &bytes_transferred, options);
+    if (status != FT_OK)
+        LOG;
+    if (bytes_transferred != tx_len)
+        LOG;
+}
 
 void convert_temp_raw_to_c(int16_t raw_out, float *temp_c)
 {
@@ -575,13 +591,13 @@ bool bmi270_chip_id_correct(uint8_t chip_id)
     return (chip_id == BMI270_CHIP_ID);
 }
 
-uint8_t bmi270_spi_get_id(FT_HANDLE handle)
+uint8_t bmi270_spi_get_id(void)
 {
     const uint8_t tx = (CHIP_ID_REG) | (SPI_READ_MASK);
     uint16_t rx = 0xAAAA; // 2 bytes, 1 dummy byte
     uint8_t chip_id;
 
-    spi_shift_bytes_with_cs(handle, &tx, sizeof(tx), (uint8_t *)&rx, sizeof(rx));
+    spi_shift_bytes_with_cs(&tx, sizeof(tx), (uint8_t *)&rx, sizeof(rx));
     
     chip_id = ((rx >> 8) & 0xFF); // 1st byte is dummy
 
@@ -599,17 +615,322 @@ void delay_blocking(uint32_t count)
             i -= 2;
     }
 }
+
+
+// Per section 3, step 1b
+void bmi270_perform_init_seq(void)
+{
+    uint32_t config_len = sizeof(bmi270_config_file_with_reg_addr);
+    uint8_t write[2] = {PWR_CONF_REG, 0u};
+    spi_write_with_cs(write, sizeof(write));
+
+    // TODO: Supposed to wait for 450usec
+    timer_blocking_sleep_msec(1u);
+    
+    write[0] = INIT_CTRL_REG; // write[1] still 0
+    spi_write_with_cs(write, sizeof(write));
+
+    spi_write_with_cs(bmi270_config_file_with_reg_addr, config_len);
+
+    write[1] = 1u; // write[0] still INIT_CTRL_REG
+    spi_write_with_cs(write, sizeof(write));
+}
+
+bool bmi270_init_status_correct(void)
+{
+    const uint8_t tx = (INTERNAL_STATUS_REG) | (SPI_READ_MASK);
+    uint16_t rx = 0xAAAA; // 2 bytes, 1 dummy byte
+    uint8_t init_status;
+
+    spi_shift_bytes_with_cs(&tx, sizeof(tx), (uint8_t *)&rx, sizeof(rx));
+    init_status = ((rx >> 8) & 0xFF); // 1st byte is dummy
+
+    return (init_status & 1u);
+}
+
+void flush_fifo(void) // Note: Register will always return 0x00 as read result
+{
+    const uint8_t write[2] = {CMD_REG, 0xB0};
+    spi_write_with_cs(write, sizeof(write));
+}
+
+// 13-bit value, so max count 2 ^ 13 = 8192 bytes
+uint16_t get_fifo_byte_count(void)
+{
+    uint16_t byte_count;
+    const uint8_t tx = (FIFO_LENGTH_0_REG) | (SPI_READ_MASK);
+    uint8_t rx[3] = {0}; // Includes 1 dummy byte
+
+    spi_shift_bytes_with_cs(&tx, sizeof(tx), rx, sizeof(rx));
+    
+    byte_count = (rx[2] << 8) | (rx[1] & 0xFF);
+    //printf("fifo_count: 0x%x\n", byte_count);
+    //printf("[0]: 0x%x [1]: 0x%x [2]: 0x%x\n", rx[0], rx[1], rx[2]);
+
+    return byte_count;
+}
+
+bool bmi270_init_gyro_accel_fifo(bool header_en, bool gyro_en, bool accel_en, bool aux_en)
+{
+    bool success;
+    success = true;
+    // Store Accelerometer, Gyroscope data in FIFO (all 3 axes), FIFO frame header enable
+    uint8_t val = 0u;
+    uint8_t write[2] = {FIFO_CONFIG_1_REG, 0u};
+    uint8_t read[3] = {0};
+    read[0] = (FIFO_CONFIG_1_REG) | (SPI_READ_MASK);
+
+    if (header_en) {
+        val |= (FIFO_CONFIG1_HEADER_EN);
+    }
+    if (gyro_en) {
+        val |= (FIFO_CONFIG1_GYRO_EN);
+    }
+    if (accel_en) {
+        val |= (FIFO_CONFIG1_ACCEL_EN);
+    }
+    if (aux_en) {
+        val |= (FIFO_CONFIG1_AUX_EN);
+    }
+    write[1] = val;
+    spi_write_with_cs(write, sizeof(write));
+    // Perform readback of FIFO configuration register as sanity test
+    spi_shift_bytes_with_cs(read, 1, &read[1], sizeof(read) - 1u);
+    if (read[2] != val) {
+        success = false;
+        //printf("FIFO_CONFIG1 mismatch: 0x%x\n", read[2]);
+    }
+    return success;
+}
+
+// Per section 3 step 3
+bool bmi270_configure_accel_gyro(OutputDataRateHz accel_data_rate,
+                AccRangeG accel_range,
+                OutputDataRateHz gyro_data_rate, GyroRangeDps gyro_range)
+{
+    bool success;
+    int32_t cmp;
+    uint32_t i __attribute__((unused));
+    uint8_t write[2] = {PWR_CTRL_REG, 0xE};
+    uint8_t config_write[5] = {0};
+    uint8_t config_read[sizeof(config_write) + 1u] = {0}; //  + 1 dummy byte
+    config_read[0] = (ACC_CONF_REG) | (SPI_READ_MASK);
+
+    // ACC_CONF: Enable the acc_filter_perf bit; set acc_bwp to normal mode;
+    // set acc_odr  to accel_data_rate
+    config_write[0] = ACC_CONF_REG;
+    config_write[1] = 0xA0 | accel_data_rate;
+    // ACC_RANGE
+    config_write[2] = accel_range;
+    // GYR_CONF: Enable the gyr_filter_perf bit; set gyr_bwp to normal mode;
+    // set gyr_odr  to gyro_data_rate
+    config_write[3] = 0xA0 | gyro_data_rate;
+    // GYR_RANGE
+    config_write[4] = gyro_range;
+
+
+    // PWR_CTRL: Enable acquisition of acceleration, gyroscope and temperature
+    // sensor data.  Disable the auxiliary interface
+    spi_write_with_cs(write, sizeof(write));
+
+    spi_write_with_cs(config_write, sizeof(config_write));
+    // Perform readback of configuration registers as sanity test
+    spi_shift_bytes_with_cs(config_read, 1, &config_read[1], sizeof(config_read) - 1u);
+    cmp = memcmp(&config_write[1], &config_read[2], sizeof(config_write) - 1u);
+    if (!cmp) {
+        success = true;
+    } else {
+        success = false;
+        for (i = 1; i < sizeof(config_write); i++) {
+            //printf("write[%d]: 0x%x read[%d]: 0x%x\n", i, config_write[i], i, config_read[i + 1]);
+        }
+    }
+
+    // PWR_CONF: Disable the adv_power_save_bit; leave the fifo_self_wakeup enabled
+    write[0] = PWR_CONF_REG;
+    write[1] = 0x02;
+    spi_write_with_cs(write, sizeof(write));
+    return success;
+}
+
+
+bool bmi270_spi_init(FT_HANDLE handle, OutputDataRateHz accel_data_rate,
+                AccRangeG accel_range,
+                OutputDataRateHz gyro_data_rate, GyroRangeDps gyro_range)
+{
+    bool success;
+    uint32_t i __attribute__((unused));
+    uint8_t device_id __attribute__((unused));
+
+
+    // Sanitize inputs
+    if (accel_data_rate > ODR_800_HZ) {
+        accel_data_rate = ODR_25_HZ;
+    }
+    if (accel_range > ACC_RANGE_16G) {
+        accel_range = ACC_RANGE_2G;
+    }
+    if (gyro_data_rate > ODR_800_HZ) {
+        gyro_data_rate = ODR_25_HZ;
+    }
+    if (gyro_range >= GYRO_RANGE_125DPS) {
+        gyro_range = GYRO_RANGE_250DPS;
+    }
+
+    memset(&current, 0u, sizeof(MotionInfo));
+    current.handle = handle;
+    current.accel_lsb_per_g = accel_sensitivity_lsb_per_g[accel_range];
+    current.gyro_lsb_per_dps = gyro_sensitivity_lsb_per_deg_per_sec[gyro_range];
+
+    device_id = bmi270_spi_get_id();
+    success = bmi270_chip_id_correct(device_id);
+    if (success) {
+        // Naveed: Check if already initialized correctly
+        success = bmi270_init_status_correct();
+        if (!success) { // Otherwise, go through full initialization process
+            bmi270_perform_init_seq();
+            // TODO: Supposed to wait for +20ms
+            timer_blocking_sleep_msec(40u);
+            success = bmi270_init_status_correct();
+            //if (success) // Disregard status and configure anyway as comms still intact
+            {
+                success = bmi270_configure_accel_gyro(accel_data_rate, accel_range,
+                                                    gyro_data_rate, gyro_range);
+            }
+            //bmi270_init_gyro_accel_fifo(true, true, true, false);
+            //flush_fifo();
+        }
+
+    }
+    /*if (success) {
+        bmi270_perform_init_seq();
+        // TODO: Supposed to wait for +20ms
+        dummy_blocking_sleep_half_msec(40u);
+        success = bmi270_init_status_correct();
+        //if (success) // Disregard status and configure anyway as comms still intact
+        {
+            success = bmi270_configure_accel_gyro(accel_data_rate, accel_range, gyro_data_rate, gyro_range);
+        }
+        //bmi270_init_gyro_accel_fifo(true, true, true, false);
+        //flush_fifo();
+    }*/
+
+    return success;
+}
+
+
+void convert_gyro_data(MotionInfo *current)
+{
+    convert_gyro_raw_to_dps(current->raw_data.gyro.pitch_x, current->gyro_lsb_per_dps, &current->accel_g_gyro_dps.gyro.pitch_x);
+    convert_gyro_raw_to_dps(current->raw_data.gyro.roll_y, current->gyro_lsb_per_dps, &current->accel_g_gyro_dps.gyro.roll_y);
+    convert_gyro_raw_to_dps(current->raw_data.gyro.yaw_z, current->gyro_lsb_per_dps, &current->accel_g_gyro_dps.gyro.yaw_z);
+
+    convert_gyro_dps_to_rad_per_sec(current->accel_g_gyro_dps.gyro.pitch_x, &current->accel_m_per_s2_gyro_rad_per_s.gyro.pitch_x);
+    convert_gyro_dps_to_rad_per_sec(current->accel_g_gyro_dps.gyro.roll_y, &current->accel_m_per_s2_gyro_rad_per_s.gyro.roll_y);
+    convert_gyro_dps_to_rad_per_sec(current->accel_g_gyro_dps.gyro.yaw_z, &current->accel_m_per_s2_gyro_rad_per_s.gyro.yaw_z);
+}
+
+void convert_accel_data(MotionInfo *current)
+{
+    convert_accel_raw_to_g(current->raw_data.accel.pitch_x, current->accel_lsb_per_g, &current->accel_g_gyro_dps.accel.pitch_x);
+    convert_accel_raw_to_g(current->raw_data.accel.roll_y, current->accel_lsb_per_g, &current->accel_g_gyro_dps.accel.roll_y);
+    convert_accel_raw_to_g(current->raw_data.accel.yaw_z, current->accel_lsb_per_g, &current->accel_g_gyro_dps.accel.yaw_z);
+
+    convert_accel_g_to_m_per_s2(current->accel_g_gyro_dps.accel.pitch_x, &current->accel_m_per_s2_gyro_rad_per_s.accel.pitch_x);
+    convert_accel_g_to_m_per_s2(current->accel_g_gyro_dps.accel.roll_y, &current->accel_m_per_s2_gyro_rad_per_s.accel.roll_y);
+    convert_accel_g_to_m_per_s2(current->accel_g_gyro_dps.accel.yaw_z, &current->accel_m_per_s2_gyro_rad_per_s.accel.yaw_z);
+}
+
+void update_current_data(MotionInfo *current)
+{
+    convert_accel_data(current);
+    convert_gyro_data(current);
+}
+
+void bmi270_print_latest_converted_data(void)
+{
+    //printf("accel_x_raw: %d accel_y_raw: %d accel_z_raw: %d\n", current.raw_data.accel.pitch_x, current.raw_data.accel.roll_y, current.raw_data.accel.yaw_z);
+    printf("x(m/s^2): %.2f x(rad/s): %.2f\n", current.accel_m_per_s2_gyro_rad_per_s.accel.pitch_x, current.accel_m_per_s2_gyro_rad_per_s.gyro.pitch_x);
+    printf("y(m/s^2): %.2f y(rad/s): %.2f\n", current.accel_m_per_s2_gyro_rad_per_s.accel.roll_y, current.accel_m_per_s2_gyro_rad_per_s.gyro.roll_y);
+    printf("z(m/s^2): %.2f z(rad/s): %.2f\n", current.accel_m_per_s2_gyro_rad_per_s.accel.yaw_z, current.accel_m_per_s2_gyro_rad_per_s.gyro.yaw_z);
+}
+
+
+void bmi270_spi_read_data(void)
+{
+    const uint8_t addr = (ACC_X_LSB_REG) | (SPI_READ_MASK);
+    uint8_t data[13] = {0};
+
+    spi_shift_bytes_with_cs(&addr, sizeof(addr), data, sizeof(data));
+
+    /*uint32_t i;
+    for (i = 0; i < sizeof(data); i++) {
+        //printf("data[%d]: 0x%x\n", i, data[i]);
+    }*/
+    memcpy(&current.raw_data, &data[1], sizeof(data) - 1u);
+    update_current_data(&current);
+}
+
+void bmi270_spi_read_raw_data(uint8_t *rx, uint32_t max_rx_len)
+{
+    const uint32_t max_transfer_len = 13u;
+    uint8_t data[13] = {0};
+    const uint8_t addr = (ACC_X_LSB_REG) | (SPI_READ_MASK);
+    if (max_rx_len >= max_transfer_len) {
+        // Don't bother reading, return
+        return;
+    }
+
+    spi_shift_bytes_with_cs(&addr, sizeof(addr), data, max_transfer_len); // 1 dummy byte
+    memcpy(rx, &data[1], max_rx_len);
+}
+
+uint8_t frame_header_mode(uint8_t header_byte)
+{
+    return (uint8_t)((header_byte >> 6) & 0x03);
+}
+
+uint8_t frame_header_param(uint8_t header_byte)
+{
+    return (uint8_t)((header_byte >> 2) & 0x07);
+}
+
+bool header_for_control_frame(uint8_t header_byte)
+{
+    return (bool)(frame_header_mode(header_byte) == 1u);
+}
+
+bool header_for_regular_frame(uint8_t header_byte)
+{
+    return (bool)(frame_header_mode(header_byte) == 2u);
+}
+
+bool frame_contains_gyro_data(uint8_t header_byte)
+{
+    return (bool)(frame_header_param(header_byte) & 2u);
+}
+
+bool frame_contains_accel_data(uint8_t header_byte)
+{
+    return (bool)(frame_header_param(header_byte) & 1u);
+}
+
+bool frame_contains_accel_and_gyro_data(uint8_t header_byte)
+{
+    return (bool)(frame_header_param(header_byte) & 3u);
+}
+
 int main(int argc, char **argv)
 {
     uint32_t i;
     bool success;
-    uint8_t device_id;
     Init_libMPSSE();
 
     FT_STATUS status;
     FT_DEVICE_LIST_INFO_NODE channel_info;
     SpiChannelConfig channel_config;
     FT_HANDLE handle;
+    float init_timer;
     float start;
 
     // check how many MPSSE channels are available
@@ -643,15 +964,17 @@ int main(int argc, char **argv)
     status = SPI_InitChannel(handle, &channel_config);
     if (status != FT_OK)
         LOG;
+    
+    // Initialize BMI270
+    init_timer = timer_start_elapsed_timer();
+    success = bmi270_spi_init(handle, ODR_25_HZ, ACC_RANGE_2G, ODR_25_HZ, GYRO_RANGE_250DPS);
+    printf("bmi270_spi_init: %d after %.1fms\n", success, timer_elapsed_time_msec(init_timer));
 
     while (1) {
         start = timer_start_elapsed_timer();
-        device_id = bmi270_spi_get_id(handle);
-        //timer_blocking_sleep_msec(5);
-        success = bmi270_chip_id_correct(device_id);
-        if (success) {
-            printf("chip_id: 0x%x read in %5.2f ms\n", device_id, timer_elapsed_time_msec(start));
-        }
+        bmi270_spi_read_data();
+        bmi270_print_latest_converted_data();
+        printf("read time: %.2fms\n", timer_elapsed_time_msec(start));
         timer_blocking_sleep_remaining_msec(start, 500u);
 
     }
