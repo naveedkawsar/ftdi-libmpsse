@@ -52,6 +52,10 @@ typedef struct {
     ThreeAxisInt gyro; // Angular rate
 } RawMotionData;
 
+typedef struct {
+    ThreeAxisInt gyro; // Angular rate
+    ThreeAxisInt accel; // Linear acceleration
+} RawFifoData;
 
 typedef struct {
     float pitch_x;
@@ -64,13 +68,27 @@ typedef struct {
     ThreeAxisFloat gyro; // Angular rate
 } ConvertedMotionData;
 
+typedef struct
+{
+    ThreeAxisFloat g_force;
+    ThreeAxisFloat m_per_sec_squared;
+} AccelUnits;
+
+typedef struct
+{
+    ThreeAxisFloat deg_per_sec;
+    ThreeAxisFloat rad_per_sec;
+} GyroUnits;
+
 
 bool bmi270_spi_init(FT_HANDLE handle, OutputDataRateHz accel_data_rate,
                 AccRangeG accel_range,
                 OutputDataRateHz gyro_data_rate, GyroRangeDps gyro_range);
 void bmi270_spi_read_data(void);
 void bmi270_spi_read_raw_data(uint8_t *rx, uint32_t max_rx_len);
-void bmi270_spi_read_fifo(void);
+void bmi270_spi_flush_fifo(void);
+void bmi270_spi_read_headerless_fifo(void);
 void bmi270_print_latest_converted_data(void);
+void bmi270_print_fifo_converted_data(void);
 
 #endif // BMI270_H_

@@ -2,10 +2,19 @@
 #include <stdio.h>
 #include "bmi270.h"
 #include "timer.h"
+#include "ftd2xx.h"
 //#include "libmpsse_spi.h"
 //#include "ftdi_libMPSSE.h"
 
-#define LOG (printf("%s | func: %s() line: %d\n", __FILE__, __func__, __LINE__))
+
+// Max FIFO count after testing 2016 bytes (datasheet says 2kB)
+// Each sample is 12 bytes wide:
+// 2 bytes/axis * 3 axis * 2 devices (accel + gyro) = 12 bytes
+// 2016 bytes / 12 bytes/sample = 168Hz total
+// Half the samples are for accel, and half for gyro, so 84Hz each
+// Allocating 100Hz of buffer space for gyro and accel each
+#define MAX_FIFO_SAMPLES_PER_SENSOR_PER_READ (100u)
+
 #define SPI_WRITE_OPTIONS (SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE| SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE)
 
 #define false (0u)
@@ -15,6 +24,8 @@
 #define BMI270_SDA_MOSI_PIN    (27u) // I2C data line
 #define BMI270_SCLK_PIN        (28u)
 #define BMI270_CSEL_PIN        (29u) // Set high for I2C
+
+#define ACCEL_GYRO_FRAME_LEN   (12u)
 
 #define SPI_READ_MASK       (uint8_t)(0x80) // (1 << 7)
 
@@ -57,7 +68,7 @@
 #define G_TO_M_PER_S_SQUARED        (9.80665f)
 #define MILLI_G_TO_M_PER_S_SQUARED   (0.00980665f)
 
-#define FIELD_SIZEOF(t, f) (sizeof(((t*)0)->f))
+
 
 // Indexed by AccRangeG.  Per Table 2
 const int16_t accel_sensitivity_lsb_per_g[] =
@@ -80,14 +91,16 @@ const float gyro_sensitivity_lsb_per_deg_per_sec[] =
 
 typedef struct {
     FT_HANDLE handle;
-    RawMotionData raw_data;
     int16_t accel_lsb_per_g;
     float gyro_lsb_per_dps;
-    ConvertedMotionData accel_g_gyro_dps; // Gyroscope -> deg/s, Accelerometer -> g
-    ConvertedMotionData accel_m_per_s2_gyro_rad_per_s; // Gyroscope -> rad/s, Accelerometer -> m/s^2
-} MotionInfo;
+    int16_t accel_sample_count;
+    int16_t gyro_sample_count;
+    uint8_t rx_bytes[2048];
+    AccelUnits converted_accel[MAX_FIFO_SAMPLES_PER_SENSOR_PER_READ];
+    GyroUnits converted_gyro[MAX_FIFO_SAMPLES_PER_SENSOR_PER_READ];
+} MotionStatus;
 
-MotionInfo current;
+MotionStatus current;
 
 void spi_shift_bytes_with_cs(const uint8_t *tx, uint32_t tx_len, uint8_t *rx, uint32_t rx_len)
 {
@@ -648,14 +661,14 @@ bool bmi270_init_status_correct(void)
     return (init_status & 1u);
 }
 
-void flush_fifo(void) // Note: Register will always return 0x00 as read result
+void bmi270_spi_flush_fifo(void) // Note: Register will always return 0x00 as read result
 {
     const uint8_t write[2] = {CMD_REG, 0xB0};
     spi_write_with_cs(write, sizeof(write));
 }
 
 // 13-bit value, so max count 2 ^ 13 = 8192 bytes
-uint16_t get_fifo_byte_count(void)
+uint16_t fifo_byte_count_spi(void)
 {
     uint16_t byte_count;
     const uint8_t tx = (FIFO_LENGTH_0_REG) | (SPI_READ_MASK);
@@ -670,7 +683,7 @@ uint16_t get_fifo_byte_count(void)
     return byte_count;
 }
 
-bool bmi270_init_gyro_accel_fifo(bool header_en, bool gyro_en, bool accel_en, bool aux_en)
+bool bmi270_spi_init_gyro_accel_fifo(bool header_en, bool gyro_en, bool accel_en, bool aux_en)
 {
     bool success;
     success = true;
@@ -704,7 +717,7 @@ bool bmi270_init_gyro_accel_fifo(bool header_en, bool gyro_en, bool accel_en, bo
 }
 
 // Per section 3 step 3
-bool bmi270_configure_accel_gyro(OutputDataRateHz accel_data_rate,
+bool bmi270_spi_configure_accel_gyro(OutputDataRateHz accel_data_rate,
                 AccRangeG accel_range,
                 OutputDataRateHz gyro_data_rate, GyroRangeDps gyro_range)
 {
@@ -777,7 +790,7 @@ bool bmi270_spi_init(FT_HANDLE handle, OutputDataRateHz accel_data_rate,
         gyro_range = GYRO_RANGE_250DPS;
     }
 
-    memset(&current, 0u, sizeof(MotionInfo));
+    memset(&current, 0u, sizeof(MotionStatus));
     current.handle = handle;
     current.accel_lsb_per_g = accel_sensitivity_lsb_per_g[accel_range];
     current.gyro_lsb_per_dps = gyro_sensitivity_lsb_per_deg_per_sec[gyro_range];
@@ -794,11 +807,11 @@ bool bmi270_spi_init(FT_HANDLE handle, OutputDataRateHz accel_data_rate,
             success = bmi270_init_status_correct();
             //if (success) // Disregard status and configure anyway as comms still intact
             {
-                success = bmi270_configure_accel_gyro(accel_data_rate, accel_range,
+                success = bmi270_spi_configure_accel_gyro(accel_data_rate, accel_range,
                                                     gyro_data_rate, gyro_range);
             }
-            //bmi270_init_gyro_accel_fifo(true, true, true, false);
-            //flush_fifo();
+            bmi270_spi_init_gyro_accel_fifo(false, true, true, false);
+            bmi270_spi_flush_fifo();
         }
 
     }
@@ -809,66 +822,129 @@ bool bmi270_spi_init(FT_HANDLE handle, OutputDataRateHz accel_data_rate,
         success = bmi270_init_status_correct();
         //if (success) // Disregard status and configure anyway as comms still intact
         {
-            success = bmi270_configure_accel_gyro(accel_data_rate, accel_range, gyro_data_rate, gyro_range);
+            success = bmi270_spi_configure_accel_gyro(accel_data_rate, accel_range, gyro_data_rate, gyro_range);
         }
-        //bmi270_init_gyro_accel_fifo(true, true, true, false);
-        //flush_fifo();
+        //bmi270_spi_init_gyro_accel_fifo(true, true, true, false);
+        //bmi270_spi_flush_fifo();
     }*/
 
     return success;
 }
 
 
-void convert_gyro_data(MotionInfo *current)
+void convert_gyro_data(ThreeAxisInt raw_gyro, float gyro_lsb_per_dps, ThreeAxisFloat *gyro_dps, ThreeAxisFloat *rad_per_sec)
 {
-    convert_gyro_raw_to_dps(current->raw_data.gyro.pitch_x, current->gyro_lsb_per_dps, &current->accel_g_gyro_dps.gyro.pitch_x);
-    convert_gyro_raw_to_dps(current->raw_data.gyro.roll_y, current->gyro_lsb_per_dps, &current->accel_g_gyro_dps.gyro.roll_y);
-    convert_gyro_raw_to_dps(current->raw_data.gyro.yaw_z, current->gyro_lsb_per_dps, &current->accel_g_gyro_dps.gyro.yaw_z);
+    convert_gyro_raw_to_dps(raw_gyro.pitch_x, gyro_lsb_per_dps, &gyro_dps->pitch_x);
+    convert_gyro_raw_to_dps(raw_gyro.roll_y, gyro_lsb_per_dps, &gyro_dps->roll_y);
+    convert_gyro_raw_to_dps(raw_gyro.yaw_z, gyro_lsb_per_dps, &gyro_dps->yaw_z);
 
-    convert_gyro_dps_to_rad_per_sec(current->accel_g_gyro_dps.gyro.pitch_x, &current->accel_m_per_s2_gyro_rad_per_s.gyro.pitch_x);
-    convert_gyro_dps_to_rad_per_sec(current->accel_g_gyro_dps.gyro.roll_y, &current->accel_m_per_s2_gyro_rad_per_s.gyro.roll_y);
-    convert_gyro_dps_to_rad_per_sec(current->accel_g_gyro_dps.gyro.yaw_z, &current->accel_m_per_s2_gyro_rad_per_s.gyro.yaw_z);
+    convert_gyro_dps_to_rad_per_sec(gyro_dps->pitch_x, &rad_per_sec->pitch_x);
+    convert_gyro_dps_to_rad_per_sec(gyro_dps->roll_y, &rad_per_sec->roll_y);
+    convert_gyro_dps_to_rad_per_sec(gyro_dps->yaw_z, &rad_per_sec->yaw_z);
 }
 
-void convert_accel_data(MotionInfo *current)
+void convert_accel_data(ThreeAxisInt raw_accel, int16_t accel_lsb_per_g, ThreeAxisFloat *accel_g, ThreeAxisFloat *m_per_sec_squared)
 {
-    convert_accel_raw_to_g(current->raw_data.accel.pitch_x, current->accel_lsb_per_g, &current->accel_g_gyro_dps.accel.pitch_x);
-    convert_accel_raw_to_g(current->raw_data.accel.roll_y, current->accel_lsb_per_g, &current->accel_g_gyro_dps.accel.roll_y);
-    convert_accel_raw_to_g(current->raw_data.accel.yaw_z, current->accel_lsb_per_g, &current->accel_g_gyro_dps.accel.yaw_z);
+    convert_accel_raw_to_g(raw_accel.pitch_x, accel_lsb_per_g, &accel_g->pitch_x);
+    convert_accel_raw_to_g(raw_accel.roll_y, accel_lsb_per_g, &accel_g->roll_y);
+    convert_accel_raw_to_g(raw_accel.yaw_z, accel_lsb_per_g, &accel_g->yaw_z);
 
-    convert_accel_g_to_m_per_s2(current->accel_g_gyro_dps.accel.pitch_x, &current->accel_m_per_s2_gyro_rad_per_s.accel.pitch_x);
-    convert_accel_g_to_m_per_s2(current->accel_g_gyro_dps.accel.roll_y, &current->accel_m_per_s2_gyro_rad_per_s.accel.roll_y);
-    convert_accel_g_to_m_per_s2(current->accel_g_gyro_dps.accel.yaw_z, &current->accel_m_per_s2_gyro_rad_per_s.accel.yaw_z);
+    convert_accel_g_to_m_per_s2(accel_g->pitch_x, &m_per_sec_squared->pitch_x);
+    convert_accel_g_to_m_per_s2(accel_g->roll_y, &m_per_sec_squared->roll_y);
+    convert_accel_g_to_m_per_s2(accel_g->yaw_z, &m_per_sec_squared->yaw_z);
 }
 
-void update_current_data(MotionInfo *current)
+void convert_current_data(MotionStatus *current)
 {
-    convert_accel_data(current);
-    convert_gyro_data(current);
+    RawMotionData *raw_data;
+    raw_data = (RawMotionData *)&current->rx_bytes[1];
+    convert_accel_data(raw_data->accel, current->accel_lsb_per_g,
+        &current->converted_accel[0].g_force, &current->converted_accel[0].m_per_sec_squared);
+    convert_gyro_data(raw_data->gyro, current->gyro_lsb_per_dps,
+        &current->converted_gyro[0].deg_per_sec, &current->converted_gyro[0].rad_per_sec);
+}
+
+void convert_headerless_fifo_data(MotionStatus *current)
+{
+    int16_t i;
+    RawFifoData *raw_data;
+    raw_data = (RawFifoData *)&current->rx_bytes[1];
+    for (i = 0; i < current->gyro_sample_count; i++) {
+        convert_accel_data(raw_data->accel, current->accel_lsb_per_g,
+            &current->converted_accel[i].g_force, &current->converted_accel[i].m_per_sec_squared);
+        convert_gyro_data(raw_data->gyro, current->gyro_lsb_per_dps,
+            &current->converted_gyro[i].deg_per_sec, &current->converted_gyro[i].rad_per_sec);
+    }
+}
+
+void bmi270_print_converted_data(int16_t sample_count, const AccelUnits *accel, const GyroUnits *gyro)
+{
+    int16_t i;
+    for (i = 0; i < sample_count; i++) {
+        printf("accel[%*d] (g-force | m/s%c) x: %5.2f | %5.2f y: %5.2f | %5.2f z: %5.2f |%5.2f\n",
+            2, i, '\xFD',
+            accel[i].g_force.pitch_x, accel[i].m_per_sec_squared.pitch_x,
+            accel[i].g_force.roll_y, accel[i].m_per_sec_squared.roll_y,
+            accel[i].g_force.yaw_z, accel[i].m_per_sec_squared.yaw_z);
+        printf("gyro[%*d] (%c/sec | rad/sec) x: %5.2f | %5.2f y: %5.2f | %5.2f z: %5.2f |%5.2f\n",
+            2, i, '\xF8',
+            gyro[i].deg_per_sec.pitch_x, gyro[i].rad_per_sec.pitch_x,
+            gyro[i].deg_per_sec.roll_y, gyro[i].rad_per_sec.roll_y,
+            gyro[i].deg_per_sec.yaw_z, gyro[i].rad_per_sec.yaw_z);
+    }
 }
 
 void bmi270_print_latest_converted_data(void)
 {
-    //printf("accel_x_raw: %d accel_y_raw: %d accel_z_raw: %d\n", current.raw_data.accel.pitch_x, current.raw_data.accel.roll_y, current.raw_data.accel.yaw_z);
-    printf("x(m/s^2): %.2f x(rad/s): %.2f\n", current.accel_m_per_s2_gyro_rad_per_s.accel.pitch_x, current.accel_m_per_s2_gyro_rad_per_s.gyro.pitch_x);
-    printf("y(m/s^2): %.2f y(rad/s): %.2f\n", current.accel_m_per_s2_gyro_rad_per_s.accel.roll_y, current.accel_m_per_s2_gyro_rad_per_s.gyro.roll_y);
-    printf("z(m/s^2): %.2f z(rad/s): %.2f\n", current.accel_m_per_s2_gyro_rad_per_s.accel.yaw_z, current.accel_m_per_s2_gyro_rad_per_s.gyro.yaw_z);
+    bmi270_print_converted_data(1, current.converted_accel, current.converted_gyro);
 }
 
+void bmi270_print_fifo_converted_data(void)
+{
+    bmi270_print_converted_data(current.gyro_sample_count, current.converted_accel, current.converted_gyro);
+}
+
+
+void bmi270_spi_read_headerless_fifo(void)
+{
+    const uint8_t addr = (FIFO_DATA_REG) | (SPI_READ_MASK);
+    uint16_t fifo_bytes;
+
+    fifo_bytes = fifo_byte_count_spi();
+    current.gyro_sample_count = fifo_bytes / ACCEL_GYRO_FRAME_LEN;
+    current.accel_sample_count = current.gyro_sample_count; // Same ODR in headerless mode
+
+    memset(current.rx_bytes, 0, FIELD_SIZEOF(MotionStatus, rx_bytes));
+    memset(current.converted_accel, 0, FIELD_SIZEOF(MotionStatus, converted_accel));
+    memset(current.converted_gyro, 0, FIELD_SIZEOF(MotionStatus, converted_gyro));
+    spi_shift_bytes_with_cs(&addr, sizeof(addr), current.rx_bytes, fifo_bytes + 1u);
+
+    /*uint32_t i;
+    for (i = 0; i < 14; i++) {
+        printf("[%ld]: 0x%x ", i, current.rx_bytes[i]);
+        if ((i % 6) == 0) {
+            puts("");
+        }
+    }*/
+
+    convert_headerless_fifo_data(&current);
+    printf("fifo_bytes: %d sample_count: %d\n", fifo_bytes, current.gyro_sample_count);
+}
 
 void bmi270_spi_read_data(void)
 {
     const uint8_t addr = (ACC_X_LSB_REG) | (SPI_READ_MASK);
-    uint8_t data[13] = {0};
 
-    spi_shift_bytes_with_cs(&addr, sizeof(addr), data, sizeof(data));
+    spi_shift_bytes_with_cs(&addr, sizeof(addr), current.rx_bytes, ACCEL_GYRO_FRAME_LEN + 1u);
 
     /*uint32_t i;
-    for (i = 0; i < sizeof(data); i++) {
-        //printf("data[%d]: 0x%x\n", i, data[i]);
+    for (i = 0; i < ACCEL_GYRO_FRAME_LEN + 1u; i++) {
+        printf("[%ld]: 0x%x ", i, current.rx_bytes[i]);
+        if ((i % 6) == 0) {
+            puts("");
+        }
     }*/
-    memcpy(&current.raw_data, &data[1], sizeof(data) - 1u);
-    update_current_data(&current);
+    convert_current_data(&current);
 }
 
 void bmi270_spi_read_raw_data(uint8_t *rx, uint32_t max_rx_len)
@@ -919,89 +995,3 @@ bool frame_contains_accel_and_gyro_data(uint8_t header_byte)
 {
     return (bool)(frame_header_param(header_byte) & 3u);
 }
-
-int main(int argc, char **argv)
-{
-    uint32_t i;
-    bool success;
-    Init_libMPSSE();
-
-    FT_STATUS status;
-    FT_DEVICE_LIST_INFO_NODE channel_info;
-    SpiChannelConfig channel_config;
-    FT_HANDLE handle;
-    float init_timer;
-    float start;
-
-    // check how many MPSSE channels are available
-    uint32_t channel_count = 0;
-    status = SPI_GetNumChannels(&channel_count);
-    if (status != FT_OK)
-        LOG;
-
-    printf("MPSSE channel(s) available: %ld\n", channel_count);
-    for (i = 0; i < channel_count; i++) {
-        status = SPI_GetChannelInfo(i, &channel_info);
-        if (status != FT_OK)
-            LOG;
-        puts("");
-        printf("Channel number: %ld\n", i);
-        printf("Description: %s\n", channel_info.Description);
-        printf("Serial Number: %s\n", channel_info.SerialNumber);
-    }
-    if (!channel_count)
-        return 0;
-    
-    // Open MPSSE chanel 0
-    status = SPI_OpenChannel(0, &handle);
-    if (status != FT_OK)
-        LOG;
-    printf("Handle: %p\n", handle);
-    // Configure channel 
-    channel_config.ClockRate = I2C_CLOCK_STANDARD_MODE;
-    channel_config.config_options = SPI_CONFIG_OPTION_MODE0 | SPI_CONFIG_OPTION_CS_DBUS3 | SPI_CONFIG_OPTION_CS_ACTIVELOW;
-    channel_config.LatencyTimer = 100;
-    status = SPI_InitChannel(handle, &channel_config);
-    if (status != FT_OK)
-        LOG;
-    
-    // Initialize BMI270
-    init_timer = timer_start_elapsed_timer();
-    success = bmi270_spi_init(handle, ODR_25_HZ, ACC_RANGE_2G, ODR_25_HZ, GYRO_RANGE_250DPS);
-    printf("bmi270_spi_init: %d after %.1fms\n", success, timer_elapsed_time_msec(init_timer));
-
-    while (1) {
-        start = timer_start_elapsed_timer();
-        bmi270_spi_read_data();
-        bmi270_print_latest_converted_data();
-        printf("read time: %.2fms\n", timer_elapsed_time_msec(start));
-        timer_blocking_sleep_remaining_msec(start, 500u);
-
-    }
-    Cleanup_libMPSSE();
-    return 0;
-}
-/*
-int main(int argc, char **argv)
-{
-    Init_libMPSSE();
-    // check how many MPSSE channels are available
-    uint32_t channel_count;
-    status = SPI_GetNumChannels(&channel_count);
-    if (status != FT_OK)
-        LOG;
-
-    printf("MPSSE channel(s) available: %ld\n", channel_count);
-    for (i = 0; i < channel_count; i++) {
-        status = SPI_GetChannelInfo(i, &channel_info);
-        if (status != FT_OK)
-            LOG;
-        puts("");
-        printf("Channel number: %ld\n", i);
-        printf("Description: %s\n", channel_info.Description);
-        printf("Serial Number: %s\n", channel_info.SerialNumber);
-    }
-    Cleanup_libMPSSE();
-    return 0;
-}
-*/

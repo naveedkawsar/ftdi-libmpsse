@@ -43,6 +43,10 @@
 //#include <stdint.h>
 #include "ftd2xx.h"
 
+// Naveed defines
+#define LOG (printf("%s | func: %s() line: %d\n", __FILE__, __func__, __LINE__))
+#define FIELD_SIZEOF(t, f) (sizeof(((t*)0)->f))
+
 
 /******************************************************************************/
 /*                                Macro defines                                  */
@@ -171,7 +175,7 @@ typedef struct
 
     uint8_t     LatencyTimer;
 
-    uint32_t    config_options;  /*This member provides a way to enable/disable features
+    uint32_t    ConfigOptions;  /*This member provides a way to enable/disable features
     specific to the protocol that are implemented in the chip
     BIT1-0=CPOL-CPHA:    00 - MODE0 - data captured on rising edge, propagated on falling
                          01 - MODE1 - data captured on falling edge, propagated on rising
