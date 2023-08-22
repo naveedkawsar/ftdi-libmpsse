@@ -47,6 +47,8 @@
 #define LOG (printf("%s | func: %s() line: %d\n", __FILE__, __func__, __LINE__))
 #define FIELD_SIZEOF(t, f) (sizeof(((t*)0)->f))
 
+#define false (0u)
+#define true (!false)
 
 /******************************************************************************/
 /*                                Macro defines                                  */

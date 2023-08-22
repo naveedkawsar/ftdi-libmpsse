@@ -1,10 +1,8 @@
 #include <string.h> // For memcpy(), memset()
-#include <stdio.h>
+#include <stdio.h> // For printf() used in LOG macro defined in ftdi_libMPSSE.h
 #include "bmi270.h"
 #include "timer.h"
 #include "ftd2xx.h"
-//#include "libmpsse_spi.h"
-//#include "ftdi_libMPSSE.h"
 
 
 // Max FIFO count after testing 2016 bytes (datasheet says 2kB)
@@ -16,9 +14,6 @@
 #define MAX_FIFO_SAMPLES_PER_SENSOR_PER_READ (100u)
 
 #define SPI_WRITE_OPTIONS (SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE| SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE)
-
-#define false (0u)
-#define true (!false)
 
 #define BMI270_SDO_MISO_PIN    (26u) // I2C address LSB
 #define BMI270_SDA_MOSI_PIN    (27u) // I2C data line
@@ -877,33 +872,6 @@ void convert_headerless_fifo_data(MotionStatus *current)
     }
 }
 
-void bmi270_print_converted_data(int16_t sample_count, const AccelUnits *accel, const GyroUnits *gyro)
-{
-    int16_t i;
-    for (i = 0; i < sample_count; i++) {
-        printf("accel[%*d] (g-force | m/s%c) x: %5.2f | %5.2f y: %5.2f | %5.2f z: %5.2f |%5.2f\n",
-            2, i, '\xFD',
-            accel[i].g_force.pitch_x, accel[i].m_per_sec_squared.pitch_x,
-            accel[i].g_force.roll_y, accel[i].m_per_sec_squared.roll_y,
-            accel[i].g_force.yaw_z, accel[i].m_per_sec_squared.yaw_z);
-        printf("gyro[%*d] (%c/sec | rad/sec) x: %5.2f | %5.2f y: %5.2f | %5.2f z: %5.2f |%5.2f\n",
-            2, i, '\xF8',
-            gyro[i].deg_per_sec.pitch_x, gyro[i].rad_per_sec.pitch_x,
-            gyro[i].deg_per_sec.roll_y, gyro[i].rad_per_sec.roll_y,
-            gyro[i].deg_per_sec.yaw_z, gyro[i].rad_per_sec.yaw_z);
-    }
-}
-
-void bmi270_print_latest_converted_data(void)
-{
-    bmi270_print_converted_data(1, current.converted_accel, current.converted_gyro);
-}
-
-void bmi270_print_fifo_converted_data(void)
-{
-    bmi270_print_converted_data(current.gyro_sample_count, current.converted_accel, current.converted_gyro);
-}
-
 
 void bmi270_spi_read_headerless_fifo(void)
 {
@@ -928,7 +896,6 @@ void bmi270_spi_read_headerless_fifo(void)
     }*/
 
     convert_headerless_fifo_data(&current);
-    printf("fifo_bytes: %d sample_count: %d\n", fifo_bytes, current.gyro_sample_count);
 }
 
 void bmi270_spi_read_data(void)
@@ -994,4 +961,42 @@ bool frame_contains_accel_data(uint8_t header_byte)
 bool frame_contains_accel_and_gyro_data(uint8_t header_byte)
 {
     return (bool)(frame_header_param(header_byte) & 3u);
+}
+
+const RawFifoData * const bmi270_raw_headerless_fifo_data(void)
+{
+    return (RawFifoData *)&current.rx_bytes[1];
+}
+/*
+int16_t bmi270_converted_fifo_accel(const AccelUnits *accel)
+{
+    accel = current.converted_accel;
+    return current.accel_sample_count;
+}
+
+int16_t bmi270_converted_fifo_gyro(const GyroUnits *gyro)
+{
+    gyro = current.converted_gyro;
+    return current.gyro_sample_count;
+}
+*/
+int16_t bmi270_fifo_sample_count(void)
+{
+    int16_t sample_count;
+    sample_count = current.gyro_sample_count;
+    if (current.accel_sample_count < current.gyro_sample_count)
+    {
+        sample_count = current.accel_sample_count;
+    }
+    return sample_count;
+}
+
+const AccelUnits * const bmi270_converted_fifo_accel(void)
+{
+    return current.converted_accel;
+}
+
+const GyroUnits * const bmi270_converted_fifo_gyro(void)
+{
+    return current.converted_gyro;
 }

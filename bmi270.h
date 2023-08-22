@@ -88,7 +88,10 @@ void bmi270_spi_read_data(void);
 void bmi270_spi_read_raw_data(uint8_t *rx, uint32_t max_rx_len);
 void bmi270_spi_flush_fifo(void);
 void bmi270_spi_read_headerless_fifo(void);
-void bmi270_print_latest_converted_data(void);
-void bmi270_print_fifo_converted_data(void);
+// Call bmi270_spi_read_headerless_fifo() before using the following functions
+int16_t bmi270_fifo_sample_count(void);
+const RawFifoData * const bmi270_raw_headerless_fifo_data(void);
+const AccelUnits * const bmi270_converted_fifo_accel(void);
+const GyroUnits * const bmi270_converted_fifo_gyro(void);
 
 #endif // BMI270_H_
