@@ -1,6 +1,27 @@
 #include <stdio.h>
+#include <unistd.h> // For getopt(), optarg
 #include "bmi270.h"
 #include "timer.h"
+
+typedef struct {
+    bool logging_en;
+    bool disable_debug_print;
+    uint32_t interval_time_ms;
+    AccRangeG accel_range;
+    GyroRangeDps gyro_range;
+    OutputDataRateHz odr;
+} CommandlineArgs;
+
+
+void reset_commandline_args(CommandlineArgs *args)
+{
+    args->logging_en = false;
+    args->disable_debug_print = false;
+    args->interval_time_ms = 500u;
+    args->accel_range = ACC_RANGE_2G;
+    args->gyro_range = GYRO_RANGE_250DPS;
+    args->odr = ODR_50_HZ;
+}
 
 void print_samples(int16_t sample_count)
 {
@@ -42,6 +63,103 @@ void print_fifo_samples(void)
     print_samples(sample_count);
 }
 
+
+void update_odr_from_cmdline(CommandlineArgs *args, int odr_hz)
+{
+    if (odr_hz == 25) {
+        args->odr = ODR_25_HZ;
+    } else if (odr_hz == 50) {
+        args->odr = ODR_50_HZ;
+    } else if (odr_hz == 100) {
+        args->odr = ODR_100_HZ;
+    } else if (odr_hz == 200) {
+        args->odr = ODR_200_HZ;
+    } else {
+        args->odr = ODR_50_HZ; // Default value
+    }
+}
+
+void update_accel_range_from_cmdline(CommandlineArgs *args, int g_range)
+{
+    if (g_range == 2) {
+        args->accel_range = ACC_RANGE_2G;
+    } else if (g_range == 4) {
+        args->accel_range = ACC_RANGE_4G;
+    } else if (g_range == 8) {
+        args->accel_range = ACC_RANGE_8G;
+    } else if (g_range == 16) {
+        args->accel_range = ACC_RANGE_16G;
+    } else {
+        args->accel_range = ACC_RANGE_2G; // Default value
+    }
+}
+
+void update_gyro_range_from_cmdline(CommandlineArgs *args, int dps_range)
+{
+    if (dps_range == 125) {
+        args->gyro_range = GYRO_RANGE_125DPS;
+    } else if (dps_range == 250) {
+        args->gyro_range = GYRO_RANGE_250DPS;
+    } else if (dps_range == 500) {
+        args->gyro_range = GYRO_RANGE_500DPS;
+    } else if (dps_range == 1000) {
+        args->gyro_range = GYRO_RANGE_1000DPS;
+    } else if (dps_range == 2000) {
+        args->gyro_range = GYRO_RANGE_2000DPS;
+    } else {
+        args->gyro_range = GYRO_RANGE_250DPS; // Default value
+    }
+}
+
+void print_help_msg(void)
+{
+    printf("\n");
+}
+
+void handle_cmdline_args(int argc, char **argv, CommandlineArgs *args)
+{
+    int val;
+    int opt;
+    while ((opt = getopt(argc, argv, "hidalgo?")) != -1) {
+        switch (opt) {
+        case 'h':
+            // Intentional fallthrough
+        case '?':
+            print_help_msg();
+            break;
+        case 'l':
+            args->logging_en = true;
+            break;
+        case 'd':
+            args->disable_debug_print = true;
+            break;
+        case 'i':
+            val = atoi(optarg);
+            if ((val > 0) && (val <= 1000)) { // Limit to 1sec loop
+                args->interval_time_ms = (uint32_t)val;
+            } else {
+                args->interval_time_ms = 500u;
+            }
+            break;
+        case 'a':
+            val = atoi(optarg);
+            update_accel_range_from_cmdline(args, val);
+            break;
+        case 'g':
+            val = atoi(optarg);
+            update_gyro_range_from_cmdline(args, val);
+            break;
+        case 'o':
+            val = atoi(optarg);
+            update_odr_from_cmdline(args, val);
+            break;
+        default: /* '?' */
+            print_help_msg();
+            break;
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     uint32_t i;
@@ -54,6 +172,7 @@ int main(int argc, char **argv)
     FT_HANDLE handle;
     float init_timer;
     float start;
+    CommandlineArgs args;
 
     // check how many MPSSE channels are available
     uint32_t channel_count = 0;
@@ -91,11 +210,18 @@ int main(int argc, char **argv)
     if (status != FT_OK)
         LOG;
     
+    if (argc > 1) // Arguments supplied
+    {
+        handle_cmdline_args(argc, argv, &args);
+    } else {
+        reset_commandline_args(&args);
+    }
+    
     // Initialize BMI270
     init_timer = timer_start_elapsed_timer();
-    success = bmi270_spi_init(handle, ODR_50_HZ, ACC_RANGE_2G, ODR_50_HZ, GYRO_RANGE_250DPS);
+    success = bmi270_spi_init(handle, args.odr, ACC_RANGE_2G, ODR_50_HZ, GYRO_RANGE_250DPS);
     if (!success) {
-        success = bmi270_spi_init(handle, ODR_50_HZ, ACC_RANGE_2G, ODR_50_HZ, GYRO_RANGE_250DPS);
+        success = bmi270_spi_init(handle, args.odr, ACC_RANGE_2G, ODR_50_HZ, GYRO_RANGE_250DPS);
     }
     printf("bmi270_spi_init: %d after %.1fms\n", success, timer_elapsed_time_msec(init_timer));
     bmi270_spi_flush_fifo();
