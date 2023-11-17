@@ -792,7 +792,10 @@ bool bmi270_spi_init(FT_HANDLE handle, OutputDataRateHz accel_data_rate,
 
     device_id = bmi270_spi_get_id();
     success = bmi270_chip_id_correct(device_id);
-    if (success) {
+    //if (success)
+    // Looks like sometimes even if SPI isn't ready when checking device ID,
+    // it returns valid init_status msg.  Disabling check as a result
+    {
         // Naveed: Check if already initialized correctly
         success = bmi270_init_status_correct();
         if (!success) { // Otherwise, go through full initialization process
