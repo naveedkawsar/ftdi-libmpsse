@@ -1,10 +1,21 @@
 CC=gcc
-CFLAGS=-Wall -g -L. -lmpsse
 
 SRC=./src
 INC=./inc
+FTDI=./ftdi
 TEST=./test
 BIN=./bin
+
+CFLAGS=-Wall -g -lmpsse
+
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S), Linux) #LINUX
+    CFLAGS+=-L$(FTDI)/linux
+endif
+
+ifeq ($(OS), Windows_NT)
+    CFLAGS+=-L$(FTDI)/win32
+endif
 
 DRIVER=$(TEST)/tests
 UNITY=$(TEST)/unity
@@ -16,7 +27,7 @@ INCLUDES=-I$(UNITY) \
 UNITY_SRC=$(UNITY)/unity.c
 
 bmi270: clean
-	$(CC) main.c bmi270.c timer.c $(CFLAGS) -o bmi270; ./bmi270
+	$(CC) $(SRC)/main.c $(SRC)/bmi270.c $(SRC)/timer.c $(CFLAGS) -I$(INC) -I$(FTDI) -o bmi270; ./bmi270
 
 clean:
 	rm -f bmi270.exe
