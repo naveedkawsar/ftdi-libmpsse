@@ -1,5 +1,6 @@
 #include <signal.h> // For signal(SIGINT, ...)
 #include <stdio.h> // For printf(), fprintf(), fopen(), fclose()
+#include <time.h> // For time(), localtime()
 #include <unistd.h> // For getopt(), optarg
 #include "bmi270.h"
 #include "timer.h"
@@ -43,7 +44,7 @@ void csv_log_samples(int16_t sample_count, FILE *csv)
             (uint16_t)raw_data[i].accel.yaw_z, (uint16_t)raw_data[i].gyro.yaw_z);
     }*/
     for (i = 0; i < sample_count; i++) {
-        fprintf(csv,"%04X, %04X, %04X, %04X, %04X, %04X\n",
+        fprintf(csv,"%d, %d, %d, %d, %d, %d\n",
             (int16_t)raw_data[i].accel.pitch_x, (int16_t)raw_data[i].gyro.pitch_x,
             (int16_t)raw_data[i].accel.roll_y, (int16_t)raw_data[i].gyro.roll_y,
             (int16_t)raw_data[i].accel.yaw_z, (int16_t)raw_data[i].gyro.yaw_z);
@@ -147,6 +148,14 @@ void print_help_msg(void)
     printf("\n");
 }
 
+void datetime_for_filename(char *str, int str_len)
+{
+    time_t t = time(NULL);
+    struct tm *current = localtime(&t);
+    strftime(str, str_len, "%Y-%m-%d-%H_%M_%S", current);
+    strcat(str,".csv");
+}
+
 void handle_cmdline_args(int argc, char **argv, CommandlineArgs *args)
 {
     int val;
@@ -211,6 +220,7 @@ int main(int argc, char **argv)
     float init_timer;
     float start;
     CommandlineArgs args;
+    char filename[64] = {0};
 
     // check how many MPSSE channels are available
     uint32_t channel_count = 0;
@@ -258,7 +268,9 @@ int main(int argc, char **argv)
     continue_run = true;
 
     if (args.logging_en) {
-        args.csv = fopen("MyFile.csv", "w+");
+        datetime_for_filename(filename, sizeof(filename));
+        printf("%s\n", filename);
+        args.csv = fopen(filename, "w+");
         fprintf(args.csv, "accel_x_hex, gyro_x, accel_y, gyro_y, accel_z, gyro_z\n");
     }
 
