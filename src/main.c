@@ -150,10 +150,13 @@ void print_help_msg(void)
 
 void datetime_for_filename(char *str, int str_len)
 {
+    char dir[128] = "./log/";
     time_t t = time(NULL);
     struct tm *current = localtime(&t);
     strftime(str, str_len, "%Y-%m-%d-%H_%M_%S", current);
-    strcat(str,".csv");
+    strcat(dir, str);
+    strcpy(str, dir);
+    strcat(str, ".csv");
 }
 
 void handle_cmdline_args(int argc, char **argv, CommandlineArgs *args)
@@ -271,7 +274,7 @@ int main(int argc, char **argv)
         datetime_for_filename(filename, sizeof(filename));
         printf("%s\n", filename);
         args.csv = fopen(filename, "w+");
-        fprintf(args.csv, "accel_x_hex, gyro_x, accel_y, gyro_y, accel_z, gyro_z\n");
+        fprintf(args.csv, "accel_x, gyro_x, accel_y, gyro_y, accel_z, gyro_z\n");
     }
 
     // Set up to detect Ctrl + C
