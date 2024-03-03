@@ -27,7 +27,7 @@ INCLUDES=-I$(UNITY) \
 UNITY_SRC=$(UNITY)/unity.c
 
 bmi270: clean
-	$(CC) $(SRC)/main.c $(SRC)/bmi270.c $(SRC)/timer.c $(CFLAGS) -I$(INC) -I$(FTDI) -o bmi270; ./bmi270
+	$(CC) $(SRC)/main.c $(SRC)/bmi270.c $(SRC)/nrf_delay.c $(SRC)/timer.c $(CFLAGS) -I$(INC) -I$(FTDI) -o bmi270; ./bmi270
 
 clean:
 	rm -f bmi270.exe

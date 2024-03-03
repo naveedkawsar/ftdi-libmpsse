@@ -1,24 +1,19 @@
 #include <string.h> // For memcpy(), memset()
-#include <stdio.h> // For printf() used in LOG macro defined in ftdi_libMPSSE.h
+#include <stdio.h> // For printf()
 #include "bmi270.h"
-#include "timer.h"
+#include "nrf_delay.h"
 #include "ftd2xx.h"
 
 
 // Max FIFO count after testing 2016 bytes (datasheet says 2kB)
 // Each sample is 12 bytes wide:
 // 2 bytes/axis * 3 axis * 2 devices (accel + gyro) = 12 bytes
-// 2016 bytes / 12 bytes/sample = 168Hz total
-// Half the samples are for accel, and half for gyro, so 84Hz each
-// Allocating 100Hz of buffer space for gyro and accel each
-#define MAX_FIFO_SAMPLES_PER_SENSOR_PER_READ (100u)
+// 2016 bytes / 12 bytes/sample = 168Hz
+// Allocating 168Hz of buffer space for gyro and accel each
+#define MAX_FIFO_SAMPLES_PER_SENSOR_PER_READ (168u)
+#define NUM_SPI_DUMMY_BYTES     (1u)
 
 #define SPI_WRITE_OPTIONS (SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE| SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE)
-
-#define BMI270_SDO_MISO_PIN    (26u) // I2C address LSB
-#define BMI270_SDA_MOSI_PIN    (27u) // I2C data line
-#define BMI270_SCLK_PIN        (28u)
-#define BMI270_CSEL_PIN        (29u) // Set high for I2C
 
 #define ACCEL_GYRO_FRAME_LEN   (12u)
 
@@ -129,6 +124,19 @@ void spi_write_with_cs(const uint8_t *tx, uint32_t tx_len)
         LOG;
     if (bytes_transferred != tx_len)
         LOG;
+}
+
+void print_list_in_lines(uint8_t *arr, uint32_t size)
+{
+    uint32_t i;
+    for (i = 0; i < size; i++) {
+        printf("[%ld]: 0x%02x ", i, arr[i]);
+        if ((!(i % 8)) && i) {
+            // After every 8th entry, move down a line
+            printf("\n");
+        }
+    }
+    printf("\n");
 }
 
 void convert_temp_raw_to_c(int16_t raw_out, float *temp_c)
@@ -602,12 +610,13 @@ bool bmi270_chip_id_correct(uint8_t chip_id)
 uint8_t bmi270_spi_get_id(void)
 {
     const uint8_t tx = (CHIP_ID_REG) | (SPI_READ_MASK);
-    uint16_t rx = 0xAAAA; // 2 bytes, 1 dummy byte
+    uint8_t rx[NUM_SPI_DUMMY_BYTES + 1] = {0}; // 1 byte payload
     uint8_t chip_id;
 
-    spi_shift_bytes_with_cs(&tx, sizeof(tx), (uint8_t *)&rx, sizeof(rx));
-    
-    chip_id = ((rx >> 8) & 0xFF); // 1st byte is dummy
+    spi_shift_bytes_with_cs(&tx, sizeof(tx), rx, sizeof(rx));
+    //print_list_in_lines(rx, sizeof(rx));
+
+    chip_id = rx[NUM_SPI_DUMMY_BYTES];
 
     return chip_id;
 }
@@ -633,8 +642,8 @@ void bmi270_perform_init_seq(void)
     spi_write_with_cs(write, sizeof(write));
 
     // TODO: Supposed to wait for 450usec
-    timer_blocking_sleep_msec(1u);
-    
+    nrf_delay_ms(1u);
+
     write[0] = INIT_CTRL_REG; // write[1] still 0
     spi_write_with_cs(write, sizeof(write));
 
@@ -647,11 +656,13 @@ void bmi270_perform_init_seq(void)
 bool bmi270_init_status_correct(void)
 {
     const uint8_t tx = (INTERNAL_STATUS_REG) | (SPI_READ_MASK);
-    uint16_t rx = 0xAAAA; // 2 bytes, 1 dummy byte
+    uint8_t rx[NUM_SPI_DUMMY_BYTES + 1] = {0}; // 1 byte payload
     uint8_t init_status;
 
-    spi_shift_bytes_with_cs(&tx, sizeof(tx), (uint8_t *)&rx, sizeof(rx));
-    init_status = ((rx >> 8) & 0xFF); // 1st byte is dummy
+    spi_shift_bytes_with_cs(&tx, sizeof(tx), rx, sizeof(rx));
+    //print_list_in_lines(rx, sizeof(rx));
+
+    init_status = rx[NUM_SPI_DUMMY_BYTES];
 
     return (init_status & 1u);
 }
@@ -667,13 +678,12 @@ uint16_t fifo_byte_count_spi(void)
 {
     uint16_t byte_count;
     const uint8_t tx = (FIFO_LENGTH_0_REG) | (SPI_READ_MASK);
-    uint8_t rx[3] = {0}; // Includes 1 dummy byte
+    uint8_t rx[NUM_SPI_DUMMY_BYTES + 2] = {0}; // 2 byte payload
 
     spi_shift_bytes_with_cs(&tx, sizeof(tx), rx, sizeof(rx));
-    
-    byte_count = (rx[2] << 8) | (rx[1] & 0xFF);
-    //printf("fifo_count: 0x%x\n", byte_count);
-    //printf("[0]: 0x%x [1]: 0x%x [2]: 0x%x\n", rx[0], rx[1], rx[2]);
+    byte_count = (rx[NUM_SPI_DUMMY_BYTES + 1] << 8) | (rx[NUM_SPI_DUMMY_BYTES] & 0xFF);
+
+    //print_list_in_lines(rx, sizeof(rx));
 
     return byte_count;
 }
@@ -685,7 +695,7 @@ bool bmi270_spi_init_gyro_accel_fifo(bool header_en, bool gyro_en, bool accel_en
     // Store Accelerometer, Gyroscope data in FIFO (all 3 axes), FIFO frame header enable
     uint8_t val = 0u;
     uint8_t write[2] = {FIFO_CONFIG_1_REG, 0u};
-    uint8_t read[3] = {0};
+    uint8_t read[2 + NUM_SPI_DUMMY_BYTES] = {0};
     read[0] = (FIFO_CONFIG_1_REG) | (SPI_READ_MASK);
 
     if (header_en) {
@@ -704,9 +714,9 @@ bool bmi270_spi_init_gyro_accel_fifo(bool header_en, bool gyro_en, bool accel_en
     spi_write_with_cs(write, sizeof(write));
     // Perform readback of FIFO configuration register as sanity test
     spi_shift_bytes_with_cs(read, 1, &read[1], sizeof(read) - 1u);
-    if (read[2] != val) {
+    if (read[1 + NUM_SPI_DUMMY_BYTES] != val) {
         success = false;
-        //printf("FIFO_CONFIG1 mismatch: 0x%x\n", read[2]);
+        //printf("FIFO_CONFIG1 mismatch: 0x%x\n", read[1 + NUM_SPI_DUMMY_BYTES]);
     }
     return success;
 }
@@ -721,7 +731,7 @@ bool bmi270_spi_configure_accel_gyro(OutputDataRateHz accel_data_rate,
     uint32_t i __attribute__((unused));
     uint8_t write[2] = {PWR_CTRL_REG, 0xE};
     uint8_t config_write[5] = {0};
-    uint8_t config_read[sizeof(config_write) + 1u] = {0}; //  + 1 dummy byte
+    uint8_t config_read[sizeof(config_write) + NUM_SPI_DUMMY_BYTES] = {0};
     config_read[0] = (ACC_CONF_REG) | (SPI_READ_MASK);
 
     // ACC_CONF: Enable the acc_filter_perf bit; set acc_bwp to normal mode;
@@ -744,13 +754,13 @@ bool bmi270_spi_configure_accel_gyro(OutputDataRateHz accel_data_rate,
     spi_write_with_cs(config_write, sizeof(config_write));
     // Perform readback of configuration registers as sanity test
     spi_shift_bytes_with_cs(config_read, 1, &config_read[1], sizeof(config_read) - 1u);
-    cmp = memcmp(&config_write[1], &config_read[2], sizeof(config_write) - 1u);
+    cmp = memcmp(&config_write[1], &config_read[1 + NUM_SPI_DUMMY_BYTES], sizeof(config_write) - 1u);
     if (!cmp) {
         success = true;
     } else {
         success = false;
         for (i = 1; i < sizeof(config_write); i++) {
-            //printf("write[%d]: 0x%x read[%d]: 0x%x\n", i, config_write[i], i, config_read[i + 1]);
+            //printf("write[%d]: 0x%x read[%d]: 0x%x\n", i, config_write[i], i, config_read[i + NUM_SPI_DUMMY_BYTES]);
         }
     }
 
@@ -790,41 +800,33 @@ bool bmi270_spi_init(FT_HANDLE handle, OutputDataRateHz accel_data_rate,
     current.accel_lsb_per_g = accel_sensitivity_lsb_per_g[accel_range];
     current.gyro_lsb_per_dps = gyro_sensitivity_lsb_per_deg_per_sec[gyro_range];
 
-    device_id = bmi270_spi_get_id();
-    success = bmi270_chip_id_correct(device_id);
-    //if (success)
     // Looks like sometimes even if SPI isn't ready when checking device ID,
-    // it returns valid init_status msg.  Disabling check as a result
-    {
-        // Naveed: Check if already initialized correctly
-        success = bmi270_init_status_correct();
-        if (!success) { // Otherwise, go through full initialization process
-            bmi270_perform_init_seq();
-            // TODO: Supposed to wait for +20ms
-            timer_blocking_sleep_msec(40u);
-            success = bmi270_init_status_correct();
-            //if (success) // Disregard status and configure anyway as comms still intact
-            {
-                success = bmi270_spi_configure_accel_gyro(accel_data_rate, accel_range,
-                                                    gyro_data_rate, gyro_range);
-            }
-            bmi270_spi_init_gyro_accel_fifo(false, true, true, false);
-            bmi270_spi_flush_fifo();
-        }
+    // it returns valid init_status msg.
+    // For now, keep spinning until device ID ready before proceeding
+    do {
+        device_id = bmi270_spi_get_id();
+        success = bmi270_chip_id_correct(device_id);
+        nrf_delay_ms(1u);
 
-    }
-    /*if (success) {
+    } while (!success);
+
+    // Naveed: Check if already initialized correctly
+    success = bmi270_init_status_correct();
+    if (!success)
+    { // Otherwise, go through full initialization process
         bmi270_perform_init_seq();
         // TODO: Supposed to wait for +20ms
-        dummy_blocking_sleep_half_msec(40u);
+        nrf_delay_ms(40u);
         success = bmi270_init_status_correct();
         //if (success) // Disregard status and configure anyway as comms still intact
         {
-            success = bmi270_spi_configure_accel_gyro(accel_data_rate, accel_range, gyro_data_rate, gyro_range);
+            success = bmi270_spi_configure_accel_gyro(accel_data_rate, accel_range,
+                                                gyro_data_rate, gyro_range);
+            bmi270_spi_init_gyro_accel_fifo(false, true, true, false);
         }
-        //bmi270_spi_init_gyro_accel_fifo(true, true, true, false);
-        //bmi270_spi_flush_fifo();
-    }*/
+    }
+
+    bmi270_spi_flush_fifo();
 
     return success;
 }
@@ -855,7 +857,7 @@ void convert_accel_data(ThreeAxisInt raw_accel, int16_t accel_lsb_per_g, ThreeAx
 void convert_current_data(MotionStatus *current)
 {
     RawMotionData *raw_data;
-    raw_data = (RawMotionData *)&current->rx_bytes[1];
+    raw_data = (RawMotionData *)&current->rx_bytes[NUM_SPI_DUMMY_BYTES];
     convert_accel_data(raw_data->accel, current->accel_lsb_per_g,
         &current->converted_accel[0].g_force, &current->converted_accel[0].m_per_sec_squared);
     convert_gyro_data(raw_data->gyro, current->gyro_lsb_per_dps,
@@ -866,7 +868,7 @@ void convert_headerless_fifo_data(MotionStatus *current)
 {
     int16_t i;
     RawFifoData *raw_data;
-    raw_data = (RawFifoData *)&current->rx_bytes[1];
+    raw_data = (RawFifoData *)&current->rx_bytes[NUM_SPI_DUMMY_BYTES];
     for (i = 0; i < current->gyro_sample_count; i++) {
         convert_accel_data(raw_data->accel, current->accel_lsb_per_g,
             &current->converted_accel[i].g_force, &current->converted_accel[i].m_per_sec_squared);
@@ -882,21 +884,17 @@ void bmi270_spi_read_headerless_fifo(void)
     uint16_t fifo_bytes;
 
     fifo_bytes = fifo_byte_count_spi();
+    //printf("fifo_count: %d\n", fifo_bytes);
+
     current.gyro_sample_count = fifo_bytes / ACCEL_GYRO_FRAME_LEN;
     current.accel_sample_count = current.gyro_sample_count; // Same ODR in headerless mode
 
     memset(current.rx_bytes, 0, FIELD_SIZEOF(MotionStatus, rx_bytes));
     memset(current.converted_accel, 0, FIELD_SIZEOF(MotionStatus, converted_accel));
     memset(current.converted_gyro, 0, FIELD_SIZEOF(MotionStatus, converted_gyro));
-    spi_shift_bytes_with_cs(&addr, sizeof(addr), current.rx_bytes, fifo_bytes + 1u);
+    spi_shift_bytes_with_cs(&addr, sizeof(addr), current.rx_bytes, fifo_bytes + NUM_SPI_DUMMY_BYTES);
 
-    /*uint32_t i;
-    for (i = 0; i < 14; i++) {
-        printf("[%ld]: 0x%x ", i, current.rx_bytes[i]);
-        if ((i % 6) == 0) {
-            puts("");
-        }
-    }*/
+    //print_list_in_lines(current.rx_bytes, 14);
 
     convert_headerless_fifo_data(&current);
 }
@@ -905,15 +903,9 @@ void bmi270_spi_read_data(void)
 {
     const uint8_t addr = (ACC_X_LSB_REG) | (SPI_READ_MASK);
 
-    spi_shift_bytes_with_cs(&addr, sizeof(addr), current.rx_bytes, ACCEL_GYRO_FRAME_LEN + 1u);
+    spi_shift_bytes_with_cs(&addr, sizeof(addr), current.rx_bytes, ACCEL_GYRO_FRAME_LEN + NUM_SPI_DUMMY_BYTES);
 
-    /*uint32_t i;
-    for (i = 0; i < ACCEL_GYRO_FRAME_LEN + 1u; i++) {
-        printf("[%ld]: 0x%x ", i, current.rx_bytes[i]);
-        if ((i % 6) == 0) {
-            puts("");
-        }
-    }*/
+    //print_list_in_lines(current.rx_bytes, 14);
     convert_current_data(&current);
 }
 
@@ -968,7 +960,7 @@ bool frame_contains_accel_and_gyro_data(uint8_t header_byte)
 
 const RawFifoData * const bmi270_raw_headerless_fifo_data(void)
 {
-    return (RawFifoData *)&current.rx_bytes[1];
+    return (RawFifoData *)&current.rx_bytes[NUM_SPI_DUMMY_BYTES];
 }
 /*
 int16_t bmi270_converted_fifo_accel(const AccelUnits *accel)
